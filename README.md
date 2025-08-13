@@ -1,13 +1,18 @@
 # Experimental Solana PHP classes and command line client (cli).
 
-This is a test wallet for the Solana network.  The client is coded to use devnet for testing and was generated with the 
-help of Anthropic's Claude code.  There are likely issues to be found and fixed.  I'm posting this code in case it helps anyone else :)
+This is a test wallet written in PHP for the Solana network.  The client defaults to devnet for testing and was generated with the 
+help of Anthropic's Claude code.  There are likely issues to be found and fixed (such as relying on the solana native
+client to send transactions because the serializer in this code is broken).
+
+So.. I'm posting this code in case it helps anyone else :)  
+
 
 
 ## Pre-requisites
 
 1. PostgresSQL
 2. PHP 8.2+ (ish) with the GMP and CURL extensions
+3. Solana client installed and in path (used for sending transactions) 
 
 # Installation
 

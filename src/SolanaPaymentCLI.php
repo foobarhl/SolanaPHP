@@ -1,6 +1,9 @@
 <?php
 
 
+
+require_once 'SolanaWallet.php';
+
 /**
  * Solana Payment CLI Tool
  *
@@ -12,11 +15,11 @@ class SolanaPaymentCLI
     private $wallet;
     private $network;
 
-    public function __construct($network = 'mainnet', $dbConfig=null)
+    public function __construct($network = 'mainnet',$cfg)
     {
         $this->network = $network;
         try {
-            $this->wallet = new SolanaWallet($network, $dbConfig);
+            $this->wallet = new SolanaWallet($network,$cfg);
         } catch (Exception $e) {
             $this->handleError($e);
         }
@@ -153,6 +156,7 @@ class SolanaPaymentCLI
      */
     private function handleSend($args)
     {
+        debug_print_backtrace();
         $fromWalletId = $args['from'] ?? null;
         $toAddress = $args['to'] ?? null;
         $amount = floatval($args['amount'] ?? 0);
@@ -166,7 +170,8 @@ class SolanaPaymentCLI
         echo "From wallet ID: $fromWalletId\n";
         echo "To address: $toAddress\n";
         echo "Amount: $amount SOL\n";
-        echo "Network: {$this->network}\n\n";
+        echo "Network: {$this->network}\n";
+        echo "Method: Solana CLI\n\n";
 
         echo "⚠️  This will send real SOL! Continue? (y/N): ";
         $confirm = trim(fgets(STDIN));
@@ -176,14 +181,40 @@ class SolanaPaymentCLI
             exit(0);
         }
 
-        $result = $this->wallet->sendSol($fromWalletId, $toAddress, $amount);
+        try {
+            echo "Checking balance and sending transaction...\n";
+            $result = $this->wallet->sendSol($fromWalletId, $toAddress, $amount);
 
-        echo "\n✅ Transaction completed successfully!\n";
-        echo "Signature: {$result['signature']}\n";
-        echo "From: {$result['from']}\n";
-        echo "To: {$result['to']}\n";
-        echo "Amount: {$result['amount']} SOL\n";
-        echo "View on Solana Explorer: https://explorer.solana.com/tx/{$result['signature']}\n";
+            echo "\n✅ Transaction completed successfully!\n";
+            echo "Signature: {$result['signature']}\n";
+            echo "From: {$result['from']}\n";
+            echo "To: {$result['to']}\n";
+            echo "Amount: {$result['amount']} SOL\n";
+            echo "Method: {$result['method']}\n";
+            echo "View on Solana Explorer: https://explorer.solana.com/tx/{$result['signature']}\n";
+
+        } catch (Exception $e) {
+            echo "❌ Transaction failed: " . $e->getMessage() . "\n\n";
+
+            // Provide helpful guidance based on error type
+            if (strpos($e->getMessage(), 'Solana CLI is required') !== false) {
+                echo "💡 Setup Instructions:\n";
+                echo "1. Install Solana CLI:\n";
+                echo "   sh -c \"\$(curl -sSfL https://release.solana.com/v1.17.0/install)\"\n";
+                echo "2. Add to PATH (add to ~/.bashrc or ~/.zshrc):\n";
+                echo "   export PATH=\"\$HOME/.local/share/solana/install/active_release/bin:\$PATH\"\n";
+                echo "3. Verify installation:\n";
+                echo "   solana --version\n\n";
+            } else {
+                echo "💡 Troubleshooting:\n";
+                echo "• Check network connectivity\n";
+                echo "• Verify wallet has sufficient balance\n";
+                echo "• Ensure recipient address is valid\n";
+                echo "• Try again in a few seconds (network congestion)\n\n";
+            }
+
+            exit(1);
+        }
     }
 
     /**
@@ -550,7 +581,7 @@ class SolanaPaymentCLI
         echo "  --generate              Generate new wallet and request payment\n";
         echo "  --list                  List all stored wallets\n";
         echo "  --wallet <id>           Show wallet details\n";
-        echo "  --send                  Send SOL from stored wallet\n\n";
+        echo "  --send                  Send SOL from stored wallet (requires Solana CLI)\n\n";
         echo "Monitoring Commands:\n";
         echo "  --monitor <id|address>  Monitor address for incoming payments\n";
         echo "  --sync <wallet_id>      Sync wallet transactions from blockchain\n";
@@ -567,10 +598,13 @@ class SolanaPaymentCLI
         echo "Database Setup:\n";
         echo "  Set environment variables: DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD\n";
         echo "  Set ENCRYPTION_KEY for private key encryption\n\n";
+        echo "Solana CLI Setup:\n";
+        echo "  Required for sending transactions:\n";
+        echo "  sh -c \"\$(curl -sSfL https://release.solana.com/v1.17.0/install)\"\n\n";
         echo "Examples:\n";
         echo "  # Generate new wallet\n";
         echo "  php " . basename($_SERVER['PHP_SELF']) . " --generate --label \"My Wallet\" --amount 0.5\n\n";
-        echo "  # Send SOL\n";
+        echo "  # Send SOL (requires Solana CLI)\n";
         echo "  php " . basename($_SERVER['PHP_SELF']) . " --send --from 1 --to 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU --amount 0.1\n\n";
         echo "  # Monitor wallet\n";
         echo "  php " . basename($_SERVER['PHP_SELF']) . " --monitor 1\n\n";

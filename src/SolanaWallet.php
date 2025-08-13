@@ -5,8 +5,8 @@
  *
  * Provides functionality for:
  * - Wallet generation and storage
- * - Transaction management and sending
- * - Balance monitoring and sync
+ * - Balance monitoring via RPC
+ * - Transaction management and sending via Solana CLI
  * - Payment request generation
  */
 class SolanaWallet
@@ -14,9 +14,13 @@ class SolanaWallet
     private $rpcUrl;
     private $pdo;
     private $network;
+    private $isWindows=false;
 
     public function __construct($network = 'mainnet', $dbConfig = null)
     {
+        if(strtoupper(substr(PHP_OS, 0, 3)) === 'WIN')
+            $this->isWindows=true;
+
         $this->network = $network;
         $this->setRpcUrl($network);
         $this->initDatabase($dbConfig);
@@ -62,6 +66,7 @@ class SolanaWallet
                 PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
                 PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC
             ]);
+
 
             $this->createTables();
 
@@ -137,18 +142,18 @@ class SolanaWallet
      */
     public function generateNewWallet($label = '')
     {
-        // Generate 32 random bytes for the private key
-        $privateKey = random_bytes(32);
+        // Generate 32 random bytes for the private key seed
+        $privateKeySeed = random_bytes(32);
 
-        // Use sodium_crypto_sign_seed_keypair to generate keypair from seed
-        $keypair = sodium_crypto_sign_seed_keypair($privateKey);
+        // Create Ed25519 keypair from seed
+        $keypair = sodium_crypto_sign_seed_keypair($privateKeySeed);
         $publicKey = sodium_crypto_sign_publickey($keypair);
 
         // Convert to base58 address format
         $address = $this->base58Encode($publicKey);
 
-        // Encrypt private key for storage
-        $privateKeyHex = bin2hex($privateKey);
+        // Store the seed (not the full keypair) as the private key
+        $privateKeyHex = bin2hex($privateKeySeed);
         $encryptedPrivateKey = $this->encryptPrivateKey($privateKeyHex);
 
         // Store in database
@@ -301,58 +306,8 @@ class SolanaWallet
     }
 
     // =============================================================================
-    // BLOCKCHAIN OPERATIONS
+    // BLOCKCHAIN OPERATIONS (RPC ONLY)
     // =============================================================================
-
-    /**
-     * Send SOL from a stored wallet to another address
-     */
-    public function sendSol($fromWalletId, $toAddress, $amount)
-    {
-        $wallet = $this->getWallet($fromWalletId, true);
-        if (!$wallet) {
-            throw new Exception("Wallet not found");
-        }
-
-        // Check balance
-        $balance = $this->getBalance($wallet['address']);
-        if ($balance < $amount) {
-            throw new Exception("Insufficient balance. Current: {$balance} SOL, Required: {$amount} SOL");
-        }
-
-        // Get recent blockhash
-        $recentBlockhash = $this->getRecentBlockhash();
-
-        // Create transaction
-        $transaction = $this->createTransferTransaction(
-            $wallet['private_key'],
-            $wallet['address'],
-            $toAddress,
-            $amount,
-            $recentBlockhash
-        );
-
-        // Send transaction
-        $signature = $this->sendTransaction($transaction);
-
-        // Store transaction in database
-        $this->storeTransaction([
-            'wallet_id' => $fromWalletId,
-            'signature' => $signature,
-            'type' => 'outgoing',
-            'amount' => -$amount, // Negative for outgoing
-            'from_address' => $wallet['address'],
-            'to_address' => $toAddress,
-            'fee' => 0.000005 // Approximate fee
-        ]);
-
-        return [
-            'signature' => $signature,
-            'from' => $wallet['address'],
-            'to' => $toAddress,
-            'amount' => $amount
-        ];
-    }
 
     /**
      * Check balance of a Solana address
@@ -393,6 +348,245 @@ class SolanaWallet
     }
 
     /**
+     * Get transaction details from blockchain
+     */
+    private function getTransactionDetails($signature)
+    {
+        $payload = [
+            'jsonrpc' => '2.0',
+            'id' => 1,
+            'method' => 'getTransaction',
+            'params' => [$signature, ['encoding' => 'json']]
+        ];
+
+        $response = $this->makeRpcCall($payload);
+        return $response['result'] ?? null;
+    }
+
+    /**
+     * Make RPC call to Solana network
+     */
+    private function makeRpcCall($payload)
+    {
+        $ch = curl_init($this->rpcUrl);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Content-Type: application/json',
+        ]);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
+        if ($this->isWindows) {
+            curl_setopt($ch, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+        }
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+        if (curl_error($ch)) {
+            throw new Exception('cURL error: ' . curl_error($ch));
+        }
+
+        curl_close($ch);
+
+        if ($httpCode !== 200) {
+            throw new Exception("HTTP error: $httpCode");
+        }
+
+        return json_decode($response, true);
+    }
+
+    // =============================================================================
+    // TRANSACTION SENDING (SOLANA CLI)
+    // =============================================================================
+
+    /**
+     * Send SOL from a stored wallet to another address using Solana CLI
+     */
+    public function sendSol($fromWalletId, $toAddress, $amount)
+    {
+        $wallet = $this->getWallet($fromWalletId, true);
+        if (!$wallet) {
+            throw new Exception("Wallet not found");
+        }
+
+        // Check balance first
+        $balance = $this->getBalance($wallet['address']);
+        if ($balance < $amount) {
+            throw new Exception("Insufficient balance. Current: {$balance} SOL, Required: {$amount} SOL");
+        }
+
+        // Check if Solana CLI is available
+        if (!$this->isSolanaCLIAvailable()) {
+            throw new Exception(
+                "Solana CLI is required for sending transactions.\n" .
+                "Install it from: https://docs.solana.com/cli/install-solana-cli-tools\n" .
+                "Current balance: {$balance} SOL (verified via RPC)"
+            );
+        }
+
+        // Send via CLI
+        return $this->sendSolViaCLI($wallet, $toAddress, $amount);
+    }
+
+    function findInPath(string $program): ?string
+    {
+        // If a path is already specified, just check if that file exists.
+        if (strpos($program, DIRECTORY_SEPARATOR) !== false) {
+            return is_file($program) ? $program : null;
+        }
+
+        // Get the system's PATH directories as an array. PATH_SEPARATOR is ';' on Windows.
+        $pathDirs = explode(PATH_SEPARATOR, getenv('PATH'));
+
+        // Get executable file extensions. Provide a fallback for safety.
+        $pathExts = getenv('PATHEXT') ? explode(';', getenv('PATHEXT')) : ['.COM', '.EXE', '.BAT', '.CMD'];
+
+        // Also check for the name exactly as given (no extension).
+        array_unshift($pathExts, '');
+
+        // Iterate through each directory in the PATH.
+        foreach ($pathDirs as $dir) {
+            // Skip empty entries that can result from a misconfigured PATH (e.g., ";;").
+            if (empty($dir)) {
+                continue;
+            }
+
+            // Check for the program with each possible extension.
+            foreach ($pathExts as $ext) {
+                $fullPath = rtrim($dir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $program . $ext;
+
+                // is_file() is a reliable check. is_executable() can be misleading on Windows.
+                if (is_file($fullPath)) {
+                    return $fullPath;
+                }
+            }
+        }
+
+        // Return null if the program was not found after checking all paths.
+        return null;
+    }
+
+    /**
+     * Check if Solana CLI is available
+     */
+    private function isSolanaCLIAvailable()
+    {
+        if(!$this->isWindows) {
+            $output = shell_exec('which solana 2>/dev/null');
+            return !empty(trim($output));
+        } else {
+            $res = $this->findInPath("solana.exe");// = trim(shell_exec('where.exe solana 2>/dev/nul'));
+            return !empty(trim($res));
+        }
+    }
+
+    /**
+     * Send SOL using Solana CLI tools
+     */
+    private function sendSolViaCLI($wallet, $toAddress, $amount)
+    {
+        // Create temporary keypair file
+        $tempDir = sys_get_temp_dir();
+        $keypairFile = $tempDir . '/solana_keypair_' . uniqid() . '.json';
+
+        try {
+            // Create proper keypair format for Solana CLI
+            $keypairData = $this->createKeypairFile($wallet['private_key']);
+            file_put_contents($keypairFile, json_encode($keypairData));
+
+            // Set network URL based on current network
+            $networkUrl = $this->getRpcUrlForCLI();
+
+            // Execute transfer command
+            $command = sprintf(
+                'solana transfer --url %s --keypair %s --allow-unfunded-recipient %s %s 2>&1',
+                escapeshellarg($networkUrl),
+                escapeshellarg($keypairFile),
+                escapeshellarg($toAddress),
+                escapeshellarg($amount)
+            );
+
+            $output = shell_exec($command);
+
+            // Parse output for signature
+            if (preg_match('/Signature: ([A-Za-z0-9]{87,88})/', $output, $matches)) {
+                $signature = $matches[1];
+
+                // Store transaction in database
+                $this->storeTransaction([
+                    'wallet_id' => $wallet['id'],
+                    'signature' => $signature,
+                    'type' => 'outgoing',
+                    'amount' => -$amount,
+                    'from_address' => $wallet['address'],
+                    'to_address' => $toAddress,
+                    'fee' => 0.000005 // Approximate fee
+                ]);
+
+                return [
+                    'signature' => $signature,
+                    'from' => $wallet['address'],
+                    'to' => $toAddress,
+                    'amount' => $amount,
+                    'method' => 'solana-cli'
+                ];
+
+            } else {
+                // Parse for error messages
+                if (strpos($output, 'insufficient funds') !== false) {
+                    throw new Exception("Insufficient funds in wallet");
+                } elseif (strpos($output, 'Invalid recipient address') !== false) {
+                    throw new Exception("Invalid recipient address: $toAddress");
+                } else {
+                    throw new Exception("Transaction failed: " . trim($output));
+                }
+            }
+
+        } finally {
+            // Clean up temporary file
+            if (file_exists($keypairFile)) {
+                unlink($keypairFile);
+            }
+        }
+    }
+
+    /**
+     * Create keypair file data in Solana CLI format
+     */
+    private function createKeypairFile($privateKeyHex)
+    {
+        // Convert hex private key to bytes
+        $privateKeySeed = hex2bin($privateKeyHex);
+
+        // Create Ed25519 keypair
+        $keypair = sodium_crypto_sign_seed_keypair($privateKeySeed);
+        $secretKey = sodium_crypto_sign_secretkey($keypair);
+
+        // Solana CLI expects the secret key as an array of 64 bytes
+        return array_values(unpack('C*', $secretKey));
+    }
+
+    /**
+     * Get RPC URL in format expected by Solana CLI
+     */
+    private function getRpcUrlForCLI()
+    {
+        switch ($this->network) {
+            case 'mainnet':
+                return 'mainnet-beta';
+            case 'devnet':
+                return 'devnet';
+            case 'testnet':
+                return 'testnet';
+            default:
+                return $this->rpcUrl;
+        }
+    }
+
+    // =============================================================================
+    // TRANSACTION MANAGEMENT
+    // =============================================================================
+
+    /**
      * Sync wallet transactions from blockchain
      */
     public function syncWalletTransactions($walletId)
@@ -431,10 +625,6 @@ class SolanaWallet
 
         return $newTxCount;
     }
-
-    // =============================================================================
-    // TRANSACTION MANAGEMENT
-    // =============================================================================
 
     /**
      * Get wallet transaction history from database
@@ -534,137 +724,8 @@ class SolanaWallet
     }
 
     // =============================================================================
-    // BLOCKCHAIN TRANSACTION CREATION
-    // =============================================================================
-
-    /**
-     * Create a SOL transfer transaction
-     */
-    private function createTransferTransaction($privateKeyHex, $fromAddress, $toAddress, $amount, $recentBlockhash)
-    {
-        // This is a simplified version - in production, use a proper Solana PHP library
-        $privateKeyBytes = hex2bin($privateKeyHex);
-        $fromPubkey = $this->base58Decode($fromAddress);
-        $toPubkey = $this->base58Decode($toAddress);
-
-        // Convert SOL to lamports
-        $lamports = intval($amount * 1000000000);
-
-        // Create transfer instruction (simplified)
-        $instruction = [
-            'program_id' => '11111111111111111111111111111112', // System Program
-            'accounts' => [
-                ['pubkey' => $fromAddress, 'is_signer' => true, 'is_writable' => true],
-                ['pubkey' => $toAddress, 'is_signer' => false, 'is_writable' => true]
-            ],
-            'data' => $this->encodeTransferData($lamports)
-        ];
-
-        // Create and sign transaction (simplified - use proper library in production)
-        $transaction = [
-            'recent_blockhash' => $recentBlockhash,
-            'instructions' => [$instruction],
-            'signatures' => []
-        ];
-
-        // Sign transaction
-        $message = $this->serializeMessage($transaction);
-        $signature = sodium_crypto_sign_detached($message, $privateKeyBytes . $fromPubkey);
-        $transaction['signatures'] = [base64_encode($signature)];
-
-        return $transaction;
-    }
-
-    /**
-     * Get recent blockhash from Solana network
-     */
-    private function getRecentBlockhash()
-    {
-        $payload = [
-            'jsonrpc' => '2.0',
-            'id' => 1,
-            'method' => 'getRecentBlockhash',
-            'params' => []
-        ];
-
-        $response = $this->makeRpcCall($payload);
-        return $response['result']['value']['blockhash'];
-    }
-
-    /**
-     * Send transaction to Solana network
-     */
-    private function sendTransaction($transaction)
-    {
-        // Serialize transaction (simplified)
-        $serializedTx = base64_encode(json_encode($transaction));
-
-        $payload = [
-            'jsonrpc' => '2.0',
-            'id' => 1,
-            'method' => 'sendTransaction',
-            'params' => [$serializedTx, ['encoding' => 'base64']]
-        ];
-
-        $response = $this->makeRpcCall($payload);
-
-        if (isset($response['error'])) {
-            throw new Exception("Transaction failed: " . $response['error']['message']);
-        }
-
-        return $response['result'];
-    }
-
-    /**
-     * Get transaction details from blockchain
-     */
-    private function getTransactionDetails($signature)
-    {
-        $payload = [
-            'jsonrpc' => '2.0',
-            'id' => 1,
-            'method' => 'getTransaction',
-            'params' => [$signature, ['encoding' => 'json']]
-        ];
-
-        $response = $this->makeRpcCall($payload);
-        return $response['result'] ?? null;
-    }
-
-    // =============================================================================
     // UTILITY METHODS
     // =============================================================================
-
-    /**
-     * Make RPC call to Solana network
-     */
-    private function makeRpcCall($payload)
-    {
-        $ch = curl_init($this->rpcUrl);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'Content-Type: application/json',
-        ]);
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
-        if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
-            curl_setopt($ch, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
-        }
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-
-        if (curl_error($ch)) {
-            throw new Exception('cURL error: ' . curl_error($ch));
-        }
-
-        curl_close($ch);
-
-        if ($httpCode !== 200) {
-            throw new Exception("HTTP error: $httpCode");
-        }
-
-        return json_decode($response, true);
-    }
 
     /**
      * Simple encryption for private keys (use proper encryption in production)
@@ -751,24 +812,6 @@ class SolanaWallet
         }
 
         return hex2bin($hex);
-    }
-
-    /**
-     * Encode transfer instruction data (simplified)
-     */
-    private function encodeTransferData($lamports)
-    {
-        // System Program transfer instruction: instruction type (4 bytes) + lamports (8 bytes)
-        return pack('V', 2) . pack('P', $lamports); // 2 = transfer instruction
-    }
-
-    /**
-     * Serialize transaction message (simplified)
-     */
-    private function serializeMessage($transaction)
-    {
-        // This is a very simplified version - use proper Solana library in production
-        return hash('sha256', json_encode($transaction), true);
     }
 
     // =============================================================================
