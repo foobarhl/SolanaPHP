@@ -1,6 +1,9 @@
 # Experimental Solana PHP classes and command line client (cli).
 
-This is a test wallet for the Solana network.  The client is coded to use devnet for testing.
+This is a test wallet for the Solana network.  The client is coded to use devnet for testing and was generated with the 
+help of Anthropic's Claude code.  There are likely issues to be found and fixed.  I'm posting this code in case it helps anyone else :)
+
+
 ## Pre-requisites
 
 1. PostgresSQL
@@ -16,7 +19,25 @@ This is a test wallet for the Solana network.  The client is coded to use devnet
 
 # Examples
 
+```
+  # Generate new wallet
+  php solana-cli.php --generate --label "My Wallet" --amount 0.5
+
+  # Send SOL
+  php solana-cli.php --send --from 1 --to 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU --amount 0.1
+
+  # Monitor wallet
+  php solana-cli.php --monitor 1
+
+  # List wallets
+  php solana-cli.php --list
+
+  # View transactions
+  php solana-cli.php --transactions 1
+
+```
 Generate a wallet address and issue request for 1 SOL
+
 ```
 php solana-cli.php --generate
 
