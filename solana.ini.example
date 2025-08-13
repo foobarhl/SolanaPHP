@@ -1,0 +1,9 @@
+; SolanaPHP example
+
+; PostGRES database settings
+[database]
+host=
+port=
+dbname=
+user=
+password=
